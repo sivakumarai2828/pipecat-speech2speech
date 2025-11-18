@@ -100,6 +100,45 @@
             border-left-color: #2196F3;
             color: #333;
         }
+        .log-entry.success {
+            border-left-color: #4CAF50;
+            color: #2e7d32;
+        }
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .metric {
+            background-color: #f9f9f9;
+            padding: 15px;
+            border-radius: 5px;
+            border-left: 4px solid #2196F3;
+        }
+        .metric-label {
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        .metric-value {
+            font-size: 18px;
+            font-weight: bold;
+            color: #333;
+        }
+        .audio-level {
+            height: 20px;
+            background-color: #e0e0e0;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+        .audio-level-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #4CAF50, #8BC34A, #FFC107, #FF9800, #F44336);
+            transition: width 0.1s;
+        }
+
     </style>
 </head>
 <body>
@@ -122,6 +161,34 @@
         <div class="controls">
             <button id="connectBtn" onclick="connect()">Connect</button>
             <button id="disconnectBtn" onclick="disconnect()" class="stop" disabled>Disconnect</button>
+            <button id="testBtn" onclick="runValidationTests()" disabled>Run Tests</button>
+        </div>
+        
+        <div class="metrics" id="metrics" style="display: none;">
+            <div class="metric">
+                <div class="metric-label">Connection Status</div>
+                <div class="metric-value" id="connStatus">-</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Audio Context</div>
+                <div class="metric-value" id="audioStatus">-</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Messages Sent</div>
+                <div class="metric-value" id="messagesSent">0</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Audio Received</div>
+                <div class="metric-value" id="audioReceived">0</div>
+            </div>
+        </div>
+        
+        <div class="info" id="audioLevelContainer" style="display: none;">
+            <strong>Input Audio Level:</strong>
+            <div class="audio-level">
+                <div class="audio-level-bar" id="audioLevelBar" style="width: 0%"></div>
+            </div>
+
         </div>
         
         <div class="log" id="log">
@@ -139,6 +206,15 @@
         const WS_URL = 'ws://localhost:8000/ws';
         const SAMPLE_RATE = 16000;
         const CHANNELS = 1;
+        let analyserNode = null;
+        let metricsInterval = null;
+        let audioLevelInterval = null;
+        
+        // Validation metrics
+        let messagesSent = 0;
+        let audioChunksReceived = 0;
+        let connectionStartTime = null;
+
 
         function log(message, type = 'info') {
             const logDiv = document.getElementById('log');
@@ -164,10 +240,14 @@
                 ws = new WebSocket(WS_URL);
                 
                 ws.onopen = () => {
-                    log('WebSocket connected!', 'info');
+                    log('WebSocket connected!', 'success');
                     updateStatus('Connected', 'connected');
                     document.getElementById('connectBtn').disabled = true;
                     document.getElementById('disconnectBtn').disabled = false;
+                    document.getElementById('testBtn').disabled = false;
+                    connectionStartTime = Date.now();
+                    startMetricsMonitoring();
+
                     startAudio();
                 };
                 
@@ -177,10 +257,13 @@
                         await handleAudioData(event.data);
                     } else if (event.data instanceof ArrayBuffer) {
                         // Audio data received (protobuf)
+                        audioChunksReceived++;
                         await handleAudioData(event.data);
                     } else {
                         log(`Message received: ${event.data}`, 'info');
                     }
+                    updateMetrics();
+
                 };
                 
                 ws.onerror = (error) => {
@@ -193,6 +276,9 @@
                     updateStatus('Disconnected', 'disconnected');
                     document.getElementById('connectBtn').disabled = false;
                     document.getElementById('disconnectBtn').disabled = true;
+                    document.getElementById('testBtn').disabled = true;
+                    stopMetricsMonitoring();
+
                     stopAudio();
                 };
                 
@@ -229,6 +315,12 @@
                 // Create destination for playback
                 destinationNode = audioContext.createMediaStreamDestination();
                 
+                // Create analyser for audio level monitoring
+                analyserNode = audioContext.createAnalyser();
+                analyserNode.fftSize = 256;
+                analyserNode.smoothingTimeConstant = 0.8;
+                
+
                 // Create script processor for sending audio
                 processorNode = audioContext.createScriptProcessor(4096, CHANNELS, CHANNELS);
                 
@@ -245,6 +337,8 @@
                         const protobufFrame = serializeAudioFrame(int16Data.buffer, SAMPLE_RATE, CHANNELS);
                         if (protobufFrame) {
                             ws.send(protobufFrame);
+                            messagesSent++;
+
                         }
                     }
                 };
@@ -253,6 +347,16 @@
                 processorNode.connect(audioContext.destination);
                 
                 log('Audio streaming started', 'info');
+                sourceNode.connect(analyserNode);
+                analyserNode.connect(processorNode);
+                processorNode.connect(audioContext.destination);
+                
+                // Start audio level monitoring
+                startAudioLevelMonitoring();
+                document.getElementById('audioLevelContainer').style.display = 'block';
+                
+                log('Audio streaming started', 'success');
+
                 
             } catch (error) {
                 log(`Audio error: ${error.message}`, 'error');
@@ -419,7 +523,20 @@
         }
 
         function playAudio(arrayBuffer) {
-            if (!audioContext) return;
+            if (!audioContext) {
+                log('Audio context not available for playback', 'error');
+                return;
+            }
+            
+            // Resume audio context if suspended (browser autoplay policy)
+            if (audioContext.state === 'suspended') {
+                audioContext.resume().then(() => {
+                    log('Audio context resumed', 'info');
+                }).catch(err => {
+                    log(`Failed to resume audio: ${err.message}`, 'error');
+                });
+            }
+
             
             try {
                 // Ensure the buffer length is a multiple of 2 (Int16 = 2 bytes)
@@ -482,8 +599,169 @@
                 ws = null;
             }
             stopAudio();
+            stopMetricsMonitoring();
+            messagesSent = 0;
+            audioChunksReceived = 0;
+            connectionStartTime = null;
+            document.getElementById('metrics').style.display = 'none';
+            document.getElementById('audioLevelContainer').style.display = 'none';
             log('Disconnected', 'info');
         }
+        
+        function startMetricsMonitoring() {
+            document.getElementById('metrics').style.display = 'grid';
+            updateMetrics();
+            metricsInterval = setInterval(updateMetrics, 1000);
+        }
+        
+        function stopMetricsMonitoring() {
+            if (metricsInterval) {
+                clearInterval(metricsInterval);
+                metricsInterval = null;
+            }
+            if (audioLevelInterval) {
+                clearInterval(audioLevelInterval);
+                audioLevelInterval = null;
+            }
+        }
+        
+        function updateMetrics() {
+            // Connection status
+            const connStatus = ws && ws.readyState === WebSocket.OPEN ? 'Connected' : 'Disconnected';
+            document.getElementById('connStatus').textContent = connStatus;
+            
+            // Audio context status
+            const audioStatus = audioContext ? audioContext.state : 'Not initialized';
+            document.getElementById('audioStatus').textContent = audioStatus;
+            
+            // Messages sent
+            document.getElementById('messagesSent').textContent = messagesSent;
+            
+            // Audio received
+            document.getElementById('audioReceived').textContent = audioChunksReceived;
+        }
+        
+        function startAudioLevelMonitoring() {
+            if (!analyserNode) return;
+            
+            const dataArray = new Uint8Array(analyserNode.frequencyBinCount);
+            
+            audioLevelInterval = setInterval(() => {
+                analyserNode.getByteFrequencyData(dataArray);
+                const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
+                const percentage = Math.min(100, (average / 255) * 100);
+                document.getElementById('audioLevelBar').style.width = percentage + '%';
+            }, 100);
+        }
+        
+        function validateConnection() {
+            const issues = [];
+            
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                issues.push('WebSocket not connected');
+            }
+            
+            if (!audioContext || audioContext.state !== 'running') {
+                issues.push(`Audio context not running (state: ${audioContext?.state || 'not initialized'})`);
+            }
+            
+            if (!mediaStream || !mediaStream.active) {
+                issues.push('Microphone stream not active');
+            }
+            
+            return {
+                valid: issues.length === 0,
+                issues: issues
+            };
+        }
+        
+        async function runValidationTests() {
+            log('Running validation tests...', 'info');
+            
+            const tests = [];
+            
+            // Test 1: WebSocket connection
+            tests.push({
+                name: 'WebSocket Connection',
+                result: ws && ws.readyState === WebSocket.OPEN,
+                message: ws && ws.readyState === WebSocket.OPEN ? 'Connected' : 'Not connected'
+            });
+            
+            // Test 2: Audio context
+            tests.push({
+                name: 'Audio Context',
+                result: audioContext && audioContext.state === 'running',
+                message: audioContext ? `State: ${audioContext.state}` : 'Not initialized'
+            });
+            
+            // Test 3: Microphone access
+            tests.push({
+                name: 'Microphone Access',
+                result: mediaStream && mediaStream.active,
+                message: mediaStream && mediaStream.active ? 'Active' : 'Not active'
+            });
+            
+            // Test 4: Server health check
+            try {
+                const response = await fetch('http://localhost:8000/health');
+                const data = await response.json();
+                tests.push({
+                    name: 'Server Health',
+                    result: data.status === 'ok',
+                    message: data.status === 'ok' ? 'Server is healthy' : 'Server health check failed'
+                });
+            } catch (error) {
+                tests.push({
+                    name: 'Server Health',
+                    result: false,
+                    message: `Error: ${error.message}`
+                });
+            }
+            
+            // Test 5: Protobuf serialization
+            try {
+                const testData = new Int16Array(100).fill(0);
+                const serialized = serializeAudioFrame(testData.buffer, SAMPLE_RATE, CHANNELS);
+                tests.push({
+                    name: 'Protobuf Serialization',
+                    result: serialized !== null,
+                    message: serialized ? 'Working' : 'Failed'
+                });
+            } catch (error) {
+                tests.push({
+                    name: 'Protobuf Serialization',
+                    result: false,
+                    message: `Error: ${error.message}`
+                });
+            }
+            
+            // Display results
+            log('=== Validation Test Results ===', 'info');
+            let allPassed = true;
+            tests.forEach(test => {
+                if (test.result) {
+                    log(`✅ ${test.name}: ${test.message}`, 'success');
+                } else {
+                    log(`❌ ${test.name}: ${test.message}`, 'error');
+                    allPassed = false;
+                }
+            });
+            
+            if (allPassed) {
+                log('✅ All validation tests passed!', 'success');
+            } else {
+                log('❌ Some validation tests failed. Check the logs above.', 'error');
+            }
+            
+            // Overall connection validation
+            const validation = validateConnection();
+            if (validation.valid) {
+                log('✅ Connection validation passed', 'success');
+            } else {
+                log(`❌ Connection validation failed: ${validation.issues.join(', ')}`, 'error');
+            }
+        }
+
 
         // Cleanup on page unload
         window.addEventListener('beforeunload', () => {
