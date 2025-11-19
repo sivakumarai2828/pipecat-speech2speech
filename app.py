@@ -48,7 +48,7 @@ TRANSACTION_TOOLS = [
     {
         "type": "function",
         "name": "query_transactions",
-        "description": "Query and retrieve transaction records from the database. Use this when users ask about client transactions, purchases, refunds, transaction status, approved transactions, declined transactions, or financial data. Always call this when a client ID is mentioned.",
+        "description": "REQUIRED: Call this to retrieve transaction records when users ask about client transactions, purchases, refunds, or mention client IDs like 5001, 5002, etc. Returns transaction data that you MUST describe in your response.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -268,11 +268,12 @@ class FunctionCallProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, FunctionCallInProgressFrame):
-            logger.info(f"🔧 Function call detected: {frame.function_name}")
+            logger.info(f"🔧 FUNCTION CALL DETECTED: {frame.function_name} with args: {frame.arguments}")
 
             try:
                 # Execute the function
                 result = await execute_function(frame.function_name, frame.arguments)
+                logger.info(f"📊 Function returned: {result}")
 
                 # Send structured data to frontend via WebSocket
                 if self.transport and result:
@@ -389,8 +390,9 @@ async def run_pipeline(transport, session_id: str, handle_sigint: bool = False):
 
     llm = OpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
+        model="gpt-4o",
         params=BaseOpenAILLMService.InputParams(
-            temperature=0.7,
+            temperature=0.1,
             tools=TRANSACTION_TOOLS,
             tool_choice="auto"
         ),
@@ -402,17 +404,27 @@ async def run_pipeline(transport, session_id: str, handle_sigint: bool = False):
             {
                 "role": "system",
                 "content": (
-                    "You are Julia, a helpful AI assistant for a financial transaction intelligence system. "
-                    "You help users with:\n"
-                    "- Querying client transactions (use query_transactions when users mention client IDs or ask about transactions)\n"
-                    "- Searching documents in the knowledge base (use search_documents for document-related questions)\n"
-                    "- Web searches for general information (use web_search when documents don't have the answer)\n"
-                    "- Sending email reports (use send_email_report when users ask to email reports)\n"
-                    "- Generating transaction charts (use generate_transaction_chart for visualizations)\n\n"
-                    "IMPORTANT: When users mention a client ID or ask about transactions, you MUST call the query_transactions function first. "
-                    "Always explain what you found in simple, conversational terms suitable for voice interaction. "
-                    "Keep responses concise and natural for real-time speech. "
-                    "Maintain context throughout the conversation - remember what was discussed earlier."
+                    "You are Julia, an AI assistant for transaction intelligence. You help users query transaction data.\n\n"
+
+                    "CRITICAL: You MUST call functions IMMEDIATELY - do NOT say you will do something, just DO IT:\n\n"
+
+                    "WHEN USER SAYS → YOU MUST:\n"
+                    "• 'transactions for client 5001' → IMMEDIATELY call query_transactions with clientId=5001\n"
+                    "• 'client 5002' → IMMEDIATELY call query_transactions with clientId=5002\n"
+                    "• 'show me purchases' → IMMEDIATELY call query_transactions\n"
+                    "• 'generate chart' → IMMEDIATELY call generate_transaction_chart\n"
+                    "• 'email report' → IMMEDIATELY call send_email_report\n"
+                    "• 'search documents' → IMMEDIATELY call search_documents\n\n"
+
+                    "WRONG: 'Let me get that for you' or 'I'm retrieving the details'\n"
+                    "RIGHT: Call the function immediately, then describe the results\n\n"
+
+                    "After calling a function:\n"
+                    "• Describe the specific data returned (counts, amounts, status)\n"
+                    "• Use actual numbers from the results\n"
+                    "• Keep responses short and conversational for voice\n\n"
+
+                    "NEVER promise to do something - just call the function and describe the results!"
                 ),
             }
         ]
